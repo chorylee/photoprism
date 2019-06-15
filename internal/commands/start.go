@@ -1,10 +1,15 @@
 package commands
 
 import (
-	"fmt"
-	"log"
+	"context"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-	"github.com/photoprism/photoprism/internal/context"
+	log "github.com/sirupsen/logrus"
+
+	"github.com/photoprism/photoprism/internal/config"
 	"github.com/photoprism/photoprism/internal/server"
 	"github.com/urfave/cli"
 )
@@ -19,43 +24,52 @@ var StartCommand = cli.Command{
 
 var startFlags = []cli.Flag{
 	cli.IntFlag{
-		Name:   "server-port, p",
+		Name:   "http-port, p",
 		Usage:  "HTTP server port",
 		Value:  80,
-		EnvVar: "PHOTOPRISM_SERVER_PORT",
+		EnvVar: "PHOTOPRISM_HTTP_PORT",
 	},
 	cli.StringFlag{
-		Name:   "server-host, i",
+		Name:   "http-host, i",
 		Usage:  "HTTP server host",
 		Value:  "",
-		EnvVar: "PHOTOPRISM_SERVER_HOST",
+		EnvVar: "PHOTOPRISM_HTTP_HOST",
 	},
 	cli.StringFlag{
-		Name:   "server-mode, m",
+		Name:   "http-mode, m",
 		Usage:  "debug, release or test",
 		Value:  "",
-		EnvVar: "PHOTOPRISM_SERVER_MODE",
+		EnvVar: "PHOTOPRISM_HTTP_MODE",
 	},
 }
 
 func startAction(ctx *cli.Context) error {
-	conf := context.NewConfig(ctx)
-
-	if conf.GetServerPort() < 1 {
-		log.Fatal("Server port must be a positive integer")
+	// pass this context down the chain
+	cctx, cancel := context.WithCancel(context.Background())
+	conf := config.NewConfig(ctx)
+	if conf.HttpServerPort() < 1 {
+		log.Fatal("server port must be a positive integer")
 	}
 
 	if err := conf.CreateDirectories(); err != nil {
 		log.Fatal(err)
 	}
 
+	if err := conf.Init(cctx); err != nil {
+		log.Fatal(err)
+	}
 	conf.MigrateDb()
 
-	fmt.Printf("Starting web server at %s:%d...\n", ctx.String("server-host"), ctx.Int("server-port"))
+	log.Infof("starting web server at %s:%d", conf.HttpServerHost(), conf.HttpServerPort())
+	go server.Start(cctx, conf)
 
-	server.Start(conf)
+	quit := make(chan os.Signal)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
-	fmt.Println("Done.")
-
+	<-quit
+	log.Info("Shutting down...")
+	conf.Shutdown()
+	cancel()
+	time.Sleep(3 * time.Second)
 	return nil
 }

@@ -1,4 +1,4 @@
-FROM photoprism/development:20181219 as build
+FROM photoprism/development:20190606 as build
 
 # Set up project directory
 WORKDIR "/go/src/github.com/photoprism/photoprism"
@@ -10,6 +10,11 @@ RUN make all install
 # Base base image as photoprism/development
 FROM ubuntu:18.04
 
+# Set environment variables
+ENV DEBIAN_FRONTEND noninteractive
+ENV TF_CPP_MIN_LOG_LEVEL 2
+ENV PHOTOPRISM_CONFIG_FILE /srv/photoprism/config/photoprism.yml
+
 WORKDIR /srv/photoprism
 
 # Install additional distribution packages
@@ -20,7 +25,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         wget \
         ca-certificates \
         tzdata \
-        && \
+        libheif-examples \
+        exiftool && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -28,7 +34,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=build /etc/apt/sources.list.d/pmjdebruijn-ubuntu-darktable-release-bionic.list /etc/apt/sources.list.d/pmjdebruijn-ubuntu-darktable-release-bionic.list
 COPY --from=build /etc/apt/trusted.gpg.d/pmjdebruijn_ubuntu_darktable-release.gpg /etc/apt/trusted.gpg.d/pmjdebruijn_ubuntu_darktable-release.gpg
 COPY --from=build /usr/local/bin/photoprism /usr/local/bin/photoprism
-COPY --from=build /etc/photoprism/photoprism.yml /etc/photoprism/photoprism.yml
 COPY --from=build /usr/local/lib/libtensorflow.so /usr/local/lib/libtensorflow.so
 COPY --from=build /usr/local/lib/libtensorflow_framework.so /usr/local/lib/libtensorflow_framework.so
 COPY --from=build /srv/photoprism /srv/photoprism

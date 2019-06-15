@@ -4,6 +4,8 @@ import (
 	"os"
 
 	"github.com/photoprism/photoprism/internal/commands"
+	"github.com/photoprism/photoprism/internal/config"
+	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
 
@@ -14,9 +16,9 @@ func main() {
 	app.Name = "PhotoPrism"
 	app.Usage = "Browse your life in pictures"
 	app.Version = version
-	app.Copyright = "(c) 2018 The PhotoPrism contributors <hello@photoprism.org>"
+	app.Copyright = "(c) 2018-2019 The PhotoPrism contributors <hello@photoprism.org>"
 	app.EnableBashCompletion = true
-	app.Flags = commands.GlobalFlags
+	app.Flags = config.GlobalFlags
 
 	app.Commands = []cli.Command{
 		commands.ConfigCommand,
@@ -26,8 +28,10 @@ func main() {
 		commands.IndexCommand,
 		commands.ConvertCommand,
 		commands.ThumbnailsCommand,
-		commands.ExportCommand,
+		commands.VersionCommand,
 	}
 
-	app.Run(os.Args)
+	if err := app.Run(os.Args); err != nil {
+		log.Error(err)
+	}
 }

@@ -2,6 +2,7 @@ package photoprism
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"time"
@@ -10,9 +11,11 @@ import (
 	"github.com/rwcarlsen/goexif/mknote"
 )
 
-// ExifData returns information about a single image.
-type ExifData struct {
+// Exif returns information about a single image.
+type Exif struct {
+	UUID        string
 	DateTime    time.Time
+	TimeZone    string
 	Artist      string
 	CameraMake  string
 	CameraModel string
@@ -20,7 +23,6 @@ type ExifData struct {
 	LensModel   string
 	Aperture    float64
 	FocalLength float64
-	UniqueID    string
 	Lat         float64
 	Long        float64
 	Thumbnail   []byte
@@ -29,21 +31,32 @@ type ExifData struct {
 	Orientation int
 }
 
-// GetExifData return ExifData given a single mediaFile.
-func (m *MediaFile) GetExifData() (*ExifData, error) {
+func init() {
+	exif.RegisterParsers(mknote.All...)
+}
+
+// Exif returns exif meta data of a media file.
+func (m *MediaFile) Exif() (result *Exif, err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			result = m.exifData
+			err = fmt.Errorf("error while parsing exif data: %s", e)
+		}
+	}()
+
 	if m == nil {
-		return nil, errors.New("media file is null")
+		return nil, errors.New("can't parse exif data: file instance is null")
 	}
 
 	if m.exifData != nil {
 		return m.exifData, nil
 	}
 
-	if !m.IsPhoto() {
-		return nil, errors.New("not a JPEG or Raw file")
+	if !m.IsJpeg() && !m.IsRaw() {
+		return nil, errors.New(fmt.Sprintf("media file not compatible with exif: \"%s\"", m.Filename()))
 	}
 
-	m.exifData = &ExifData{}
+	m.exifData = &Exif{}
 
 	file, err := m.openFile()
 
@@ -52,8 +65,6 @@ func (m *MediaFile) GetExifData() (*ExifData, error) {
 	}
 
 	defer file.Close()
-
-	exif.RegisterParsers(mknote.All...)
 
 	x, err := exif.Decode(file)
 
@@ -109,6 +120,10 @@ func (m *MediaFile) GetExifData() (*ExifData, error) {
 		m.exifData.DateTime = tm
 	}
 
+	if tz, err := x.TimeZone(); err == nil {
+		m.exifData.TimeZone = tz.String()
+	}
+
 	if lat, long, err := x.LatLong(); err == nil {
 		m.exifData.Lat = lat
 		m.exifData.Long = long
@@ -119,7 +134,7 @@ func (m *MediaFile) GetExifData() (*ExifData, error) {
 	}
 
 	if uniqueID, err := x.Get(exif.ImageUniqueID); err == nil {
-		m.exifData.UniqueID = uniqueID.String()
+		m.exifData.UUID = uniqueID.String()
 	}
 
 	if width, err := x.Get(exif.ImageWidth); err == nil {
@@ -136,5 +151,5 @@ func (m *MediaFile) GetExifData() (*ExifData, error) {
 		m.exifData.Orientation = 1
 	}
 
-	return m.exifData, nil
+	return m.exifData, err
 }

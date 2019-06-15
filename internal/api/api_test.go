@@ -5,18 +5,15 @@ import (
 	"net/http/httptest"
 
 	"github.com/gin-gonic/gin"
-	"github.com/photoprism/photoprism/internal/photoprism"
-	"github.com/photoprism/photoprism/internal/test"
+	"github.com/photoprism/photoprism/internal/config"
 )
 
 // API test helper
-func NewApiTest() (app *gin.Engine, router *gin.RouterGroup, conf photoprism.Config) {
-	conf = test.NewConfig()
+func NewApiTest() (app *gin.Engine, router *gin.RouterGroup, conf *config.Config) {
+	conf = config.TestConfig()
 	gin.SetMode(gin.TestMode)
 	app = gin.New()
-
 	router = app.Group("/api/v1")
-
 	return app, router, conf
 }
 

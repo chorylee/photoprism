@@ -1,10 +1,12 @@
 /assets/photos/*
 /assets/cache/*
-/assets/database/*
-/internal/photoprism/testdata/*
 /frontend/node_modules/*
-/assets/server/public/build/*
+/node_modules
+/assets/resources/database/*
+/assets/resources/static/build/*
+/assets/resources/nasnet
 /assets/testdata
+/assets/backups
 Dockerfile
 /photoprism
 docker-compose*
@@ -12,3 +14,4 @@ docker-compose*
 .dockerignore
 .idea
 .DS_Store
+/frontend/tests/acceptance/screenshots

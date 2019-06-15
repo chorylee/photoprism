@@ -1,26 +1,50 @@
 package server
 
 import (
+	"context"
 	"fmt"
+	"net/http"
 
 	"github.com/gin-gonic/gin"
-	"github.com/photoprism/photoprism/internal/photoprism"
+	"github.com/photoprism/photoprism/internal/config"
+	log "github.com/sirupsen/logrus"
 )
 
 // Start the REST API server using the configuration provided
-func Start(conf photoprism.Config) {
-	if conf.GetServerMode() != "" {
-		gin.SetMode(conf.GetServerMode())
-	} else if conf.IsDebug() == false {
+func Start(ctx context.Context, conf *config.Config) {
+	if conf.HttpServerMode() != "" {
+		gin.SetMode(conf.HttpServerMode())
+	} else if conf.Debug() == false {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
-	app := gin.Default()
+	router := gin.New()
+	router.Use(gin.Logger(), gin.Recovery())
 
 	// Set template directory
-	app.LoadHTMLGlob(conf.GetTemplatesPath() + "/*")
+	router.LoadHTMLGlob(conf.HttpTemplatesPath() + "/*")
 
-	registerRoutes(app, conf)
+	registerRoutes(router, conf)
 
-	app.Run(fmt.Sprintf("%s:%d", conf.GetServerIP(), conf.GetServerPort()))
+	server := &http.Server{
+		Addr:    fmt.Sprintf("%s:%d", conf.HttpServerHost(), conf.HttpServerPort()),
+		Handler: router,
+	}
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil {
+			if err == http.ErrServerClosed {
+				log.Info("web server shutdown complete")
+			} else {
+				log.Errorf("web server closed unexpect: %s", err)
+			}
+		}
+	}()
+
+	<-ctx.Done()
+	log.Info("shutting down web server")
+	err := server.Close()
+	if err != nil {
+		log.Errorf("web server shutdown failed: %v", err)
+	}
 }

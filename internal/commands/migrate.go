@@ -1,9 +1,11 @@
 package commands
 
 import (
-	"fmt"
+	"context"
+	"time"
 
-	"github.com/photoprism/photoprism/internal/context"
+	"github.com/photoprism/photoprism/internal/config"
+	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
 
@@ -15,13 +17,24 @@ var MigrateCommand = cli.Command{
 }
 
 func migrateAction(ctx *cli.Context) error {
-	conf := context.NewConfig(ctx)
+	start := time.Now()
 
-	fmt.Println("Migrating database...")
+	conf := config.NewConfig(ctx)
+	cctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := conf.Init(cctx); err != nil {
+		return err
+	}
+
+	log.Infoln("migrating database")
 
 	conf.MigrateDb()
 
-	fmt.Println("Done.")
+	elapsed := time.Since(start)
+
+	log.Infof("database migration completed in %s", elapsed)
+
+	conf.Shutdown()
 
 	return nil
 }

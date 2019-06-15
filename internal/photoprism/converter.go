@@ -2,27 +2,22 @@ package photoprism
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+
+	"github.com/photoprism/photoprism/internal/config"
 )
 
 // Converter wraps a darktable cli binary.
 type Converter struct {
-	darktableCli string
+	conf *config.Config
 }
 
 // NewConverter returns a new converter by setting the darktable
 // cli binary location.
-func NewConverter(darktableCli string) *Converter {
-	if stat, err := os.Stat(darktableCli); err != nil {
-		log.Print("Darktable CLI binary could not be found at " + darktableCli)
-	} else if stat.IsDir() {
-		log.Print("Darktable CLI must be a file, not a directory")
-	}
-
-	return &Converter{darktableCli: darktableCli}
+func NewConverter(conf *config.Config) *Converter {
+	return &Converter{conf: conf}
 }
 
 // ConvertAll converts all the files given a path to JPEG. This function
@@ -31,7 +26,7 @@ func (c *Converter) ConvertAll(path string) {
 	err := filepath.Walk(path, func(filename string, fileInfo os.FileInfo, err error) error {
 
 		if err != nil {
-			log.Print(err.Error())
+			log.Error("Walk", err.Error())
 			return nil
 		}
 
@@ -46,28 +41,48 @@ func (c *Converter) ConvertAll(path string) {
 		}
 
 		if _, err := c.ConvertToJpeg(mediaFile); err != nil {
-			log.Print(err.Error())
+			log.Warnf("file could not be converted to JPEG: \"%s\"", filename)
 		}
 
 		return nil
 	})
 
 	if err != nil {
-		log.Print(err.Error())
+		log.Error(err.Error())
 	}
+}
+
+func (c *Converter) ConvertCommand(image *MediaFile, jpegFilename string, xmpFilename string) (result *exec.Cmd, err error) {
+	if image.IsRaw() {
+		if c.conf.SipsBin() != "" {
+			result = exec.Command(c.conf.SipsBin(), "-s format jpeg", image.filename, "--out "+jpegFilename)
+		} else if c.conf.DarktableBin() != "" && xmpFilename != "" {
+			result = exec.Command(c.conf.DarktableBin(), image.filename, xmpFilename, jpegFilename)
+		} else if c.conf.DarktableBin() != "" {
+			result = exec.Command(c.conf.DarktableBin(), image.filename, jpegFilename)
+		} else {
+			return nil, fmt.Errorf("no binary for raw to jpeg conversion could be found: %s", image.Filename())
+		}
+	} else if image.IsHEIF() {
+		result = exec.Command(c.conf.HeifConvertBin(), image.filename, jpegFilename)
+	} else {
+		return nil, fmt.Errorf("image type not supported for conversion: %s", image.Type())
+	}
+
+	return result, nil
 }
 
 // ConvertToJpeg converts a single image the JPEG format.
 func (c *Converter) ConvertToJpeg(image *MediaFile) (*MediaFile, error) {
 	if !image.Exists() {
-		return nil, fmt.Errorf("can not convert, file does not exist: %s", image.GetFilename())
+		return nil, fmt.Errorf("can not convert, file does not exist: %s", image.Filename())
 	}
 
 	if image.IsJpeg() {
 		return image, nil
 	}
 
-	baseFilename := image.GetCanonicalNameFromFileWithDirectory()
+	baseFilename := image.CanonicalNameFromFileWithDirectory()
 
 	jpegFilename := baseFilename + ".jpg"
 
@@ -77,19 +92,17 @@ func (c *Converter) ConvertToJpeg(image *MediaFile) (*MediaFile, error) {
 		return mediaFile, nil
 	}
 
-	log.Printf("Converting \"%s\" to \"%s\"\n", image.filename, jpegFilename)
+	log.Infof("converting \"%s\" to \"%s\"", image.filename, jpegFilename)
 
 	xmpFilename := baseFilename + ".xmp"
 
-	var convertCommand *exec.Cmd
-
-	if _, err := os.Stat(xmpFilename); err == nil {
-		convertCommand = exec.Command(c.darktableCli, image.filename, xmpFilename, jpegFilename)
-	} else {
-		convertCommand = exec.Command(c.darktableCli, image.filename, jpegFilename)
+	if _, err := os.Stat(xmpFilename); err != nil {
+		xmpFilename = ""
 	}
 
-	if err := convertCommand.Run(); err != nil {
+	if convertCommand, err := c.ConvertCommand(image, jpegFilename, xmpFilename); err != nil {
+		return nil, err
+	} else if err := convertCommand.Run(); err != nil {
 		return nil, err
 	}
 

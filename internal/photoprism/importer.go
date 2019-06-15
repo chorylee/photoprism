@@ -2,20 +2,20 @@ package photoprism
 
 import (
 	"fmt"
-	"io"
-	"log"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
 
-	"github.com/photoprism/photoprism/internal/fsutil"
+	"github.com/photoprism/photoprism/internal/config"
+
+	"github.com/photoprism/photoprism/internal/util"
 )
 
-// Importer todo: Fill me.
+// Importer is responsible for importing new files to originals.
 type Importer struct {
-	originalsPath          string
+	conf                   *config.Config
 	indexer                *Indexer
 	converter              *Converter
 	removeDotFiles         bool
@@ -24,9 +24,9 @@ type Importer struct {
 }
 
 // NewImporter returns a new importer.
-func NewImporter(originalsPath string, indexer *Indexer, converter *Converter) *Importer {
+func NewImporter(conf *config.Config, indexer *Indexer, converter *Converter) *Importer {
 	instance := &Importer{
-		originalsPath:          originalsPath,
+		conf:                   conf,
 		indexer:                indexer,
 		converter:              converter,
 		removeDotFiles:         true,
@@ -35,6 +35,10 @@ func NewImporter(originalsPath string, indexer *Indexer, converter *Converter) *
 	}
 
 	return instance
+}
+
+func (i *Importer) originalsPath() string {
+	return i.conf.OriginalsPath()
 }
 
 // ImportPhotosFromDirectory imports all the photos from a given directory path.
@@ -46,7 +50,6 @@ func (i *Importer) ImportPhotosFromDirectory(importPath string) {
 		var destinationMainFilename string
 
 		if err != nil {
-			// log.Print(err.Error())
 			return nil
 		}
 
@@ -69,29 +72,29 @@ func (i *Importer) ImportPhotosFromDirectory(importPath string) {
 			return nil
 		}
 
-		relatedFiles, mainFile, err := mediaFile.GetRelatedFiles()
+		relatedFiles, mainFile, err := mediaFile.RelatedFiles()
 
 		if err != nil {
-			log.Printf("Could not import \"%s\": %s", mediaFile.GetRelativeFilename(importPath), err.Error())
+			log.Errorf("could not import \"%s\": %s", mediaFile.RelativeFilename(importPath), err.Error())
 
 			return nil
 		}
 
 		for _, relatedMediaFile := range relatedFiles {
-			if destinationFilename, err := i.GetDestinationFilename(mainFile, relatedMediaFile); err == nil {
+			if destinationFilename, err := i.DestinationFilename(mainFile, relatedMediaFile); err == nil {
 				os.MkdirAll(path.Dir(destinationFilename), os.ModePerm)
 
 				if mainFile.HasSameFilename(relatedMediaFile) {
 					destinationMainFilename = destinationFilename
-					log.Printf("Moving main %s file \"%s\" to \"%s\"", relatedMediaFile.GetType(), relatedMediaFile.GetRelativeFilename(importPath), destinationFilename)
+					log.Infof("moving main %s file \"%s\" to \"%s\"", relatedMediaFile.Type(), relatedMediaFile.RelativeFilename(importPath), destinationFilename)
 				} else {
-					log.Printf("Moving related %s file \"%s\" to \"%s\"", relatedMediaFile.GetType(), relatedMediaFile.GetRelativeFilename(importPath), destinationFilename)
+					log.Infof("moving related %s file \"%s\" to \"%s\"", relatedMediaFile.Type(), relatedMediaFile.RelativeFilename(importPath), destinationFilename)
 				}
 
 				relatedMediaFile.Move(destinationFilename)
 			} else if i.removeExistingFiles {
 				relatedMediaFile.Remove()
-				log.Printf("Deleted \"%s\" (already exists)", relatedMediaFile.GetRelativeFilename(importPath))
+				log.Infof("deleted \"%s\" (already exists)", relatedMediaFile.RelativeFilename(importPath))
 			}
 		}
 
@@ -99,13 +102,23 @@ func (i *Importer) ImportPhotosFromDirectory(importPath string) {
 			importedMainFile, err := NewMediaFile(destinationMainFilename)
 
 			if err != nil {
-				log.Printf("Could not index \"%s\" after import: %s", destinationMainFilename, err.Error())
+				log.Errorf("could not index \"%s\" after import: %s", destinationMainFilename, err.Error())
 
 				return nil
 			}
 
 			if importedMainFile.IsRaw() {
-				i.converter.ConvertToJpeg(importedMainFile)
+				if _, err := i.converter.ConvertToJpeg(importedMainFile); err != nil {
+					log.Errorf("could not create jpeg from raw: %s", err)
+				}
+			}
+
+			if jpg, err := importedMainFile.Jpeg(); err != nil {
+				log.Error(err)
+			} else {
+				if err := jpg.CreateDefaultThumbnails(i.conf.ThumbnailsPath(), false); err != nil {
+					log.Errorf("could not create default thumbnails: %s", err)
+				}
 			}
 
 			i.indexer.IndexRelated(importedMainFile)
@@ -121,33 +134,36 @@ func (i *Importer) ImportPhotosFromDirectory(importPath string) {
 	if i.removeEmptyDirectories {
 		// Remove empty directories from import path
 		for _, directory := range directories {
-			if directoryIsEmpty(directory) {
-				os.Remove(directory)
-				log.Printf("Deleted empty directory \"%s\"", directory)
+			if util.DirectoryIsEmpty(directory) {
+				if err := os.Remove(directory); err != nil {
+					log.Errorf("could not deleted empty directory \"%s\": %s", directory, err)
+				} else {
+					log.Infof("deleted empty directory \"%s\"", directory)
+				}
 			}
 		}
 	}
 
 	if err != nil {
-		log.Print(err.Error())
+		log.Error(err.Error())
 	}
 }
 
-// GetDestinationFilename get the destination of a media file.
-func (i *Importer) GetDestinationFilename(mainFile *MediaFile, mediaFile *MediaFile) (string, error) {
-	canonicalName := mainFile.GetCanonicalName()
-	fileExtension := mediaFile.GetExtension()
-	dateCreated := mainFile.GetDateCreated()
+// DestinationFilename get the destination of a media file.
+func (i *Importer) DestinationFilename(mainFile *MediaFile, mediaFile *MediaFile) (string, error) {
+	canonicalName := mainFile.CanonicalName()
+	fileExtension := mediaFile.Extension()
+	dateCreated := mainFile.DateCreated()
 
 	//	Mon Jan 2 15:04:05 -0700 MST 2006
-	pathName := i.originalsPath + "/" + dateCreated.UTC().Format("2006/01")
+	pathName := i.originalsPath() + "/" + dateCreated.UTC().Format("2006/01")
 
 	iteration := 0
 
 	result := pathName + "/" + canonicalName + fileExtension
 
-	for fsutil.Exists(result) {
-		if mediaFile.GetHash() == fsutil.Hash(result) {
+	for util.Exists(result) {
+		if mediaFile.Hash() == util.Hash(result) {
 			return result, fmt.Errorf("file already exists: %s", result)
 		}
 
@@ -157,22 +173,4 @@ func (i *Importer) GetDestinationFilename(mainFile *MediaFile, mediaFile *MediaF
 	}
 
 	return result, nil
-}
-
-func directoryIsEmpty(path string) bool {
-	f, err := os.Open(path)
-
-	if err != nil {
-		return false
-	}
-
-	defer f.Close()
-
-	_, err = f.Readdirnames(1)
-
-	if err == io.EOF {
-		return true
-	}
-
-	return false
 }
