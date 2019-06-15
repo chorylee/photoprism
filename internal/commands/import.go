@@ -1,11 +1,12 @@
 package commands
 
 import (
-	"fmt"
-	"log"
+	"context"
+	"time"
 
-	"github.com/photoprism/photoprism/internal/context"
+	"github.com/photoprism/photoprism/internal/config"
 	"github.com/photoprism/photoprism/internal/photoprism"
+	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
 
@@ -17,27 +18,36 @@ var ImportCommand = cli.Command{
 }
 
 func importAction(ctx *cli.Context) error {
-	conf := context.NewConfig(ctx)
+	start := time.Now()
 
+	conf := config.NewConfig(ctx)
 	if err := conf.CreateDirectories(); err != nil {
-		log.Fatal(err)
+		return err
+	}
+
+	cctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := conf.Init(cctx); err != nil {
+		return err
 	}
 
 	conf.MigrateDb()
 
-	fmt.Printf("Importing photos from %s...\n", conf.ImportPath())
+	log.Infof("importing photos from %s", conf.ImportPath())
 
-	tensorFlow := photoprism.NewTensorFlow(conf.TensorFlowModelPath())
+	tensorFlow := photoprism.NewTensorFlow(conf)
 
-	indexer := photoprism.NewIndexer(conf.OriginalsPath(), tensorFlow, conf.Db())
+	indexer := photoprism.NewIndexer(conf, tensorFlow)
 
-	converter := photoprism.NewConverter(conf.DarktableCli())
+	converter := photoprism.NewConverter(conf)
 
-	importer := photoprism.NewImporter(conf.OriginalsPath(), indexer, converter)
+	importer := photoprism.NewImporter(conf, indexer, converter)
 
 	importer.ImportPhotosFromDirectory(conf.ImportPath())
 
-	fmt.Println("Done.")
+	elapsed := time.Since(start)
 
+	log.Infof("photo import completed in %s", elapsed)
+	conf.Shutdown()
 	return nil
 }

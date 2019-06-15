@@ -14,6 +14,7 @@
 package tidb
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -26,7 +27,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/terror"
-	"github.com/pingcap/pd/client"
+	pd "github.com/pingcap/pd/client"
 	pumpcli "github.com/pingcap/tidb-tools/tidb-binlog/pump_client"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/ddl"
@@ -45,9 +46,7 @@ import (
 	"github.com/pingcap/tidb/store/tikv/gcworker"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/printer"
-	"github.com/pingcap/tidb/util/signal"
-	"github.com/pingcap/tidb/util/systimemon"
-	"github.com/pingcap/tidb/x-server"
+	xserver "github.com/pingcap/tidb/x-server"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/push"
 	log "github.com/sirupsen/logrus"
@@ -63,35 +62,52 @@ var (
 )
 
 // Start the TiDB server using the configuration provided
-func Start(path string, port uint, host string, debug bool) {
+func Start(ctx context.Context, path string, port uint, host string, debug bool) {
+	if err := logutil.SetLevel("fatal"); err != nil {
+		log.Error(err)
+	}
+
 	registerStores()
 	registerMetrics()
 	loadConfig()
 
-	cfg.Log.Level = "error"
+	cfg.Log.Level = log.GetLevel().String()
+
+	// cfg.Security.SkipGrantTable = true
+	if debug {
+		cfg.Log.Level = "error"
+		host = "0.0.0.0"
+	}
+
 	cfg.Path = path
 	cfg.Store = "mocktikv"
-	if debug && host == "" {
-		cfg.Host = "0.0.0.0"
-	} else {
-		cfg.Host = "localhost"
+
+	if host == "" {
+		host = "localhost"
 	}
+
+	cfg.Host = host
 	cfg.Port = port
 	cfg.Status.ReportStatus = false
 
 	validateConfig()
 	setGlobalVars()
-	setupLog()
-	setupTracing() // Should before createServer and after setup config.
-	printInfo()
+	setupTracing()
+
+	if debug {
+		printInfo()
+	}
+
 	setupBinlogClient()
-	setupMetrics()
+	// setupMetrics()
 	createStoreAndDomain()
 	createServer()
-	signal.SetupSignalHandler(serverShutdown)
-	runServer()
+	go runServer()
+
+	<-ctx.Done()
+	serverShutdown(true)
 	cleanup()
-	os.Exit(0)
+	log.Info("tidb server shutdown complete")
 }
 
 func registerStores() {
@@ -273,17 +289,9 @@ func setGlobalVars() {
 	tikv.CommitMaxBackoff = int(parseDuration(cfg.TiKVClient.CommitTimeout).Seconds() * 1000)
 }
 
-func setupLog() {
-	err := logutil.InitLogger(cfg.Log.ToLogConfig())
-	terror.MustNil(err)
-}
-
 func printInfo() {
 	// Make sure the TiDB info is always printed.
-	level := log.GetLevel()
-	log.SetLevel(log.InfoLevel)
 	printer.PrintTiDBInfo()
-	log.SetLevel(level)
 }
 
 func createServer() {
@@ -306,32 +314,19 @@ func createServer() {
 
 func serverShutdown(isgraceful bool) {
 	if isgraceful {
+		log.Info("graceful database shutdown")
 		graceful = true
+	} else {
+		log.Info("database shutdown")
 	}
+
 	if xsvr != nil {
 		xsvr.Close() // Should close xserver before server.
 	}
+
 	svr.Close()
-}
 
-func setupMetrics() {
-	// Enable the mutex profile, 1/10 of mutex blocking event sampling.
-	runtime.SetMutexProfileFraction(10)
-	systimeErrHandler := func() {
-		metrics.TimeJumpBackCounter.Inc()
-	}
-	callBackCount := 0
-	sucessCallBack := func() {
-		callBackCount++
-		// It is callback by monitor per second, we increase metrics.KeepAliveCounter per 5s.
-		if callBackCount >= 5 {
-			callBackCount = 0
-			metrics.KeepAliveCounter.Inc()
-		}
-	}
-	go systimemon.StartMonitor(time.Now, systimeErrHandler, sucessCallBack)
-
-	pushMetric(cfg.Status.MetricsAddr, time.Duration(cfg.Status.MetricsInterval)*time.Second)
+	log.Info("database server closed")
 }
 
 func setupTracing() {
@@ -345,17 +340,18 @@ func setupTracing() {
 
 func runServer() {
 	err := svr.Run()
-	terror.MustNil(err)
-	if cfg.XProtocol.XServer {
-		err := xsvr.Run()
-		terror.MustNil(err)
+	if err != nil {
+		log.Errorf("Server failed to run: %v", err)
 	}
 }
 
 func closeDomainAndStorage() {
 	dom.Close()
-	err := storage.Close()
-	terror.Log(errors.Trace(err))
+	if err := storage.Close(); err != nil {
+		log.Error(errors.Trace(err))
+	} else {
+		log.Info("database storage closed")
+	}
 }
 
 func cleanup() {

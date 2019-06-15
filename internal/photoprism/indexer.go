@@ -2,222 +2,322 @@ package photoprism
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/jinzhu/gorm"
+	"github.com/photoprism/photoprism/internal/config"
 	"github.com/photoprism/photoprism/internal/models"
+	"github.com/photoprism/photoprism/internal/util"
 )
 
 const (
-	indexResultUpdated = "Updated"
-	indexResultAdded   = "Added"
+	indexResultUpdated = "updated"
+	indexResultAdded   = "added"
 )
 
 // Indexer defines an indexer with originals path tensorflow and a db.
 type Indexer struct {
-	originalsPath string
-	tensorFlow    *TensorFlow
-	db            *gorm.DB
+	conf       *config.Config
+	tensorFlow *TensorFlow
+	db         *gorm.DB
 }
 
 // NewIndexer returns a new indexer.
 // TODO: Is it really necessary to return a pointer?
-func NewIndexer(originalsPath string, tensorFlow *TensorFlow, db *gorm.DB) *Indexer {
+func NewIndexer(conf *config.Config, tensorFlow *TensorFlow) *Indexer {
 	instance := &Indexer{
-		originalsPath: originalsPath,
-		tensorFlow:    tensorFlow,
-		db:            db,
+		conf:       conf,
+		tensorFlow: tensorFlow,
+		db:         conf.Db(),
 	}
 
 	return instance
 }
 
-// getImageTags returns all tags of a given mediafile. This function returns
-// an empty list in the case of an error.
-func (i *Indexer) getImageTags(jpeg *MediaFile) (results []*models.Tag) {
-	tags, err := i.tensorFlow.GetImageTagsFromFile(jpeg.filename)
-
-	if err != nil {
-		return results
-	}
-
-	for _, tag := range tags {
-		if tag.Probability > 0.15 { // TODO: Use config variable
-			results = i.appendTag(results, tag.Label)
-		}
-	}
-
-	return results
+func (i *Indexer) originalsPath() string {
+	return i.conf.OriginalsPath()
 }
 
-func (i *Indexer) appendTag(tags []*models.Tag, label string) []*models.Tag {
-	if label == "" {
-		return tags
+func (i *Indexer) thumbnailsPath() string {
+	return i.conf.ThumbnailsPath()
+}
+
+// classifyImage returns all matching labels for a media file.
+func (i *Indexer) classifyImage(jpeg *MediaFile) (results Labels) {
+	start := time.Now()
+
+	var thumbs []string
+
+	if jpeg.AspectRatio() == 1 {
+		thumbs = []string{"tile_224"}
+	} else {
+		thumbs = []string{"tile_224", "left_224", "right_224"}
 	}
 
-	label = strings.ToLower(label)
+	var labels Labels
 
-	for _, tag := range tags {
-		if tag.TagLabel == label {
-			return tags
+	for _, thumb := range thumbs {
+		filename, err := jpeg.Thumbnail(i.thumbnailsPath(), thumb)
+
+		if err != nil {
+			log.Error(err)
+			continue
+		}
+
+		imageLabels, err := i.tensorFlow.LabelsFromFile(filename)
+
+		if err != nil {
+			log.Error(err)
+			continue
+		}
+
+		labels = append(labels, imageLabels...)
+	}
+
+	// Sort by priority and uncertainty
+	sort.Sort(labels)
+
+	var confidence int
+
+	for _, label := range labels {
+		if confidence == 0 {
+			confidence = 100 - label.Uncertainty
+		}
+
+		if (100 - label.Uncertainty) > (confidence / 3) {
+			results = append(results, label)
 		}
 	}
 
-	tag := models.NewTag(label).FirstOrCreate(i.db)
+	elapsed := time.Since(start)
 
-	return append(tags, tag)
+	log.Debugf("finding %+v labels for %s took %s", results, jpeg.Filename(), elapsed)
+
+	return results
 }
 
 func (i *Indexer) indexMediaFile(mediaFile *MediaFile) string {
 	var photo models.Photo
 	var file, primaryFile models.File
 	var isPrimary = false
-	var colorNames []string
-	var tags []*models.Tag
 
-	canonicalName := mediaFile.GetCanonicalNameFromFile()
-	fileHash := mediaFile.GetHash()
-	relativeFileName := mediaFile.GetRelativeFilename(i.originalsPath)
+	labels := Labels{}
+	canonicalName := mediaFile.CanonicalNameFromFile()
+	fileHash := mediaFile.Hash()
+	relativeFileName := mediaFile.RelativeFilename(i.originalsPath())
 
-	photoQuery := i.db.First(&photo, "photo_canonical_name = ?", canonicalName)
+	photoQuery := i.db.Unscoped().First(&photo, "photo_canonical_name = ?", canonicalName)
+
+	if photo.TakenAt.IsZero() && photo.TakenAtChanged == false {
+		photo.TakenAt = mediaFile.DateCreated()
+		photo.TimeZone = mediaFile.TimeZone()
+	}
+
+	if photo.PhotoCanonicalName == "" {
+		photo.PhotoCanonicalName = canonicalName
+	}
+
+	if jpeg, err := mediaFile.Jpeg(); err == nil {
+		// Image classification labels
+		labels = i.classifyImage(jpeg)
+
+		// Read Exif data
+		if exifData, err := jpeg.Exif(); err == nil {
+			photo.PhotoLat = exifData.Lat
+			photo.PhotoLong = exifData.Long
+			photo.PhotoArtist = exifData.Artist
+
+			if exifData.UUID != "" {
+				log.Debugf("photo uuid: %s", exifData.UUID)
+				photo.PhotoUUID = exifData.UUID
+			} else {
+				log.Debug("no photo uuid")
+			}
+		}
+
+		// Set Camera, Lens, Focal Length and Aperture
+		photo.Camera = models.NewCamera(mediaFile.CameraModel(), mediaFile.CameraMake()).FirstOrCreate(i.db)
+		photo.Lens = models.NewLens(mediaFile.LensModel(), mediaFile.LensMake()).FirstOrCreate(i.db)
+		photo.PhotoFocalLength = mediaFile.FocalLength()
+		photo.PhotoAperture = mediaFile.Aperture()
+	}
+
+	if location, err := mediaFile.Location(); err == nil {
+		i.db.FirstOrCreate(location, "id = ?", location.ID)
+		photo.Location = location
+		photo.LocationEstimated = false
+
+		photo.Country = models.NewCountry(location.LocCountryCode, location.LocCountry).FirstOrCreate(i.db)
+
+		// Append labels from OpenStreetMap
+		if location.LocCity != "" {
+			labels = append(labels, NewLocationLabel(location.LocCity, 0, -3))
+		}
+
+		if location.LocCounty != "" {
+			labels = append(labels, NewLocationLabel(location.LocCounty, 0, -3))
+		}
+
+		if location.LocCountry != "" {
+			labels = append(labels, NewLocationLabel(location.LocCountry, 0, -3))
+		}
+
+		if location.LocCategory != "" {
+			labels = append(labels, NewLocationLabel(location.LocCategory, 0, -2))
+		}
+
+		if location.LocName != "" && len(location.LocName) <= 25 {
+			labels = append(labels, NewLocationLabel(location.LocName, 50, 0))
+		}
+
+		if location.LocType != "" {
+			labels = append(labels, NewLocationLabel(location.LocType, 0, -1))
+		}
+
+		// Sort by priority and uncertainty
+		sort.Sort(labels)
+
+		if photo.PhotoTitleChanged == false {
+			log.Infof("setting title based on the following labels: %#v", labels)
+			if len(labels) > 0 && labels[0].Priority >= -1 && labels[0].Uncertainty <= 60 && labels[0].Name != "" { // TODO: User defined title format
+				log.Infof("label for title: %#v", labels[0])
+				if location.LocCity == "" || len(location.LocCity) > 16 || strings.Contains(labels[0].Name, location.LocCity) {
+					photo.PhotoTitle = fmt.Sprintf("%s / %s / %s", util.Title(labels[0].Name), location.LocCountry, photo.TakenAt.Format("2006"))
+				} else {
+					photo.PhotoTitle = fmt.Sprintf("%s / %s / %s", util.Title(labels[0].Name), location.LocCity, photo.TakenAt.Format("2006"))
+				}
+			} else if location.LocName != "" && location.LocCity != "" {
+				if len(location.LocName) > 45 {
+					photo.PhotoTitle = util.Title(location.LocName)
+				} else if len(location.LocName) > 20 || len(location.LocCity) > 16 || strings.Contains(location.LocName, location.LocCity) {
+					photo.PhotoTitle = fmt.Sprintf("%s / %s", util.Title(location.LocName), photo.TakenAt.Format("2006"))
+				} else {
+					photo.PhotoTitle = fmt.Sprintf("%s / %s / %s", util.Title(location.LocName), location.LocCity, photo.TakenAt.Format("2006"))
+				}
+			} else if location.LocCity != "" && location.LocCountry != "" {
+				if len(location.LocCity) > 20 {
+					photo.PhotoTitle = fmt.Sprintf("%s / %s", location.LocCity, photo.TakenAt.Format("2006"))
+				} else {
+					photo.PhotoTitle = fmt.Sprintf("%s / %s / %s", location.LocCity, location.LocCountry, photo.TakenAt.Format("2006"))
+				}
+			} else if location.LocCounty != "" && location.LocCountry != "" {
+				if len(location.LocCounty) > 20 {
+					photo.PhotoTitle = fmt.Sprintf("%s / %s", location.LocCounty, photo.TakenAt.Format("2006"))
+				} else {
+					photo.PhotoTitle = fmt.Sprintf("%s / %s / %s", location.LocCounty, location.LocCountry, photo.TakenAt.Format("2006"))
+				}
+			}
+		}
+	} else {
+		log.Debugf("location cannot be determined precisely: %s", err)
+	}
+
+	if photo.PhotoTitleChanged == false && photo.PhotoTitle == "" {
+		if len(labels) > 0 && labels[0].Priority >= -1 && labels[0].Uncertainty <= 85 && labels[0].Name != "" {
+			photo.PhotoTitle = fmt.Sprintf("%s / %s", util.Title(labels[0].Name), mediaFile.DateCreated().Format("2006"))
+		} else {
+			var daytimeString string
+			hour := mediaFile.DateCreated().Hour()
+
+			switch {
+			case hour < 17:
+				daytimeString = "Unknown"
+			case hour < 20:
+				daytimeString = "Sunset"
+			default:
+				daytimeString = "Unknown"
+			}
+
+			photo.PhotoTitle = fmt.Sprintf("%s / %s", daytimeString, mediaFile.DateCreated().Format("2006"))
+		}
+	}
+
+	log.Debugf("title: \"%s\"", photo.PhotoTitle)
 
 	if photoQuery.Error != nil {
-		if jpeg, err := mediaFile.GetJpeg(); err == nil {
-			// Geo Location
-			if exifData, err := jpeg.GetExifData(); err == nil {
-				photo.PhotoLat = exifData.Lat
-				photo.PhotoLong = exifData.Long
-				photo.PhotoArtist = exifData.Artist
-			}
-
-			// PhotoColors
-			colorNames, photo.PhotoVibrantColor, photo.PhotoMutedColor = jpeg.GetColors()
-
-			photo.PhotoColors = strings.Join(colorNames, ", ")
-
-			// Tags (TensorFlow)
-			tags = i.getImageTags(jpeg)
-		}
-
-		if location, err := mediaFile.GetLocation(); err == nil {
-			i.db.FirstOrCreate(location, "id = ?", location.ID)
-			photo.Location = location
-			photo.Country = models.NewCountry(location.LocCountryCode, location.LocCountry).FirstOrCreate(i.db)
-
-			tags = i.appendTag(tags, location.LocCity)
-			tags = i.appendTag(tags, location.LocCounty)
-			tags = i.appendTag(tags, location.LocCountry)
-			tags = i.appendTag(tags, location.LocCategory)
-			tags = i.appendTag(tags, location.LocName)
-			tags = i.appendTag(tags, location.LocType)
-
-			if photo.PhotoTitle == "" && location.LocName != "" { // TODO: User defined title format
-				if len(location.LocName) > 40 {
-					photo.PhotoTitle = fmt.Sprintf("%s / %s", strings.Title(location.LocName), mediaFile.GetDateCreated().Format("2006"))
-				} else {
-					photo.PhotoTitle = fmt.Sprintf("%s / %s / %s", strings.Title(location.LocName), location.LocCity, mediaFile.GetDateCreated().Format("2006"))
-				}
-			} else if photo.PhotoTitle == "" && location.LocCity != "" {
-				photo.PhotoTitle = fmt.Sprintf("%s / %s / %s", location.LocCity, location.LocCountry, mediaFile.GetDateCreated().Format("2006"))
-			} else if photo.PhotoTitle == "" && location.LocCounty != "" {
-				photo.PhotoTitle = fmt.Sprintf("%s / %s / %s", location.LocCounty, location.LocCountry, mediaFile.GetDateCreated().Format("2006"))
-			}
-		} else {
-			log.Printf("No location: %s", err)
-
-			var recentPhoto models.Photo
-
-			if result := i.db.Order(gorm.Expr("ABS(DATEDIFF(taken_at, ?)) ASC", mediaFile.GetDateCreated())).Preload("Country").First(&recentPhoto); result.Error == nil {
-				if recentPhoto.Country != nil {
-					photo.Country = recentPhoto.Country
-				}
-			}
-		}
-
-		photo.Tags = tags
-
-		if photo.PhotoTitle == "" {
-			if len(photo.Tags) > 0 { // TODO: User defined title format
-				photo.PhotoTitle = fmt.Sprintf("%s / %s", strings.Title(photo.Tags[0].TagLabel), mediaFile.GetDateCreated().Format("2006"))
-			} else if photo.Country != nil && photo.Country.CountryName != "" {
-				photo.PhotoTitle = fmt.Sprintf("%s / %s", strings.Title(photo.Country.CountryName), mediaFile.GetDateCreated().Format("2006"))
-			} else {
-				photo.PhotoTitle = fmt.Sprintf("Unknown / %s", mediaFile.GetDateCreated().Format("2006"))
-			}
-		}
-
-		photo.Camera = models.NewCamera(mediaFile.GetCameraModel(), mediaFile.GetCameraMake()).FirstOrCreate(i.db)
-		photo.Lens = models.NewLens(mediaFile.GetLensModel(), mediaFile.GetLensMake()).FirstOrCreate(i.db)
-		photo.PhotoFocalLength = mediaFile.GetFocalLength()
-		photo.PhotoAperture = mediaFile.GetAperture()
-
-		photo.TakenAt = mediaFile.GetDateCreated()
-		photo.PhotoCanonicalName = canonicalName
 		photo.PhotoFavorite = false
 
 		i.db.Create(&photo)
-	} else if time.Now().Sub(photo.UpdatedAt).Minutes() > 10 { // If updated more than 10 minutes ago
-		if jpeg, err := mediaFile.GetJpeg(); err == nil {
-			// PhotoColors
-			colorNames, photo.PhotoVibrantColor, photo.PhotoMutedColor = jpeg.GetColors()
-
-			photo.PhotoColors = strings.Join(colorNames, ", ")
-
-			photo.Camera = models.NewCamera(mediaFile.GetCameraModel(), mediaFile.GetCameraMake()).FirstOrCreate(i.db)
-			photo.Lens = models.NewLens(mediaFile.GetLensModel(), mediaFile.GetLensMake()).FirstOrCreate(i.db)
-			photo.PhotoFocalLength = mediaFile.GetFocalLength()
-			photo.PhotoAperture = mediaFile.GetAperture()
-		}
-
+	} else {
+		// Estimate location
 		if photo.LocationID == 0 {
 			var recentPhoto models.Photo
 
-			if result := i.db.Order(gorm.Expr("ABS(DATEDIFF(taken_at, ?)) ASC", photo.TakenAt)).Preload("Country").First(&recentPhoto); result.Error == nil {
+			if result := i.db.Unscoped().Order(gorm.Expr("ABS(DATEDIFF(taken_at, ?)) ASC", photo.TakenAt)).Preload("Country").First(&recentPhoto); result.Error == nil {
 				if recentPhoto.Country != nil {
 					photo.Country = recentPhoto.Country
+					photo.LocationEstimated = true
+					log.Debugf("approximate location: %s", recentPhoto.Country.CountryName)
 				}
 			}
 		}
 
-		i.db.Save(&photo)
+		i.db.Unscoped().Save(&photo)
+	}
+
+	log.Infof("adding labels: %+v", labels)
+
+	for _, label := range labels {
+		lm := models.NewLabel(label.Name, label.Priority).FirstOrCreate(i.db)
+
+		if lm.LabelPriority != label.Priority {
+			lm.LabelPriority = label.Priority
+			i.db.Save(&lm)
+		}
+
+		plm := models.NewPhotoLabel(photo.ID, lm.ID, label.Uncertainty, label.Source).FirstOrCreate(i.db)
+
+		// Add categories
+		for _, category := range label.Categories {
+			sn := models.NewLabel(category, -1).FirstOrCreate(i.db)
+			i.db.Model(&lm).Association("LabelCategories").Append(sn)
+		}
+
+		if plm.LabelUncertainty > label.Uncertainty {
+			plm.LabelUncertainty = label.Uncertainty
+			plm.LabelSource = label.Source
+			i.db.Save(&plm)
+		}
 	}
 
 	if result := i.db.Where("file_type = 'jpg' AND file_primary = 1 AND photo_id = ?", photo.ID).First(&primaryFile); result.Error != nil {
-		isPrimary = mediaFile.GetType() == FileTypeJpeg
+		isPrimary = mediaFile.Type() == FileTypeJpeg
 	} else {
-		isPrimary = mediaFile.GetType() == FileTypeJpeg && (relativeFileName == primaryFile.FileName || fileHash == primaryFile.FileHash)
+		isPrimary = mediaFile.Type() == FileTypeJpeg && (relativeFileName == primaryFile.FileName || fileHash == primaryFile.FileHash)
 	}
 
-	fileQuery := i.db.First(&file, "file_hash = ? OR file_name = ?", fileHash, relativeFileName)
+	fileQuery := i.db.Unscoped().First(&file, "file_hash = ? OR file_name = ?", fileHash, relativeFileName)
 
 	file.PhotoID = photo.ID
 	file.FilePrimary = isPrimary
 	file.FileMissing = false
 	file.FileName = relativeFileName
 	file.FileHash = fileHash
-	file.FileType = mediaFile.GetType()
-	file.FileMime = mediaFile.GetMimeType()
-	file.FileOrientation = mediaFile.GetOrientation()
+	file.FileType = mediaFile.Type()
+	file.FileMime = mediaFile.MimeType()
+	file.FileOrientation = mediaFile.Orientation()
 
-	// Perceptual Hash
-	if file.FilePerceptualHash == "" && mediaFile.IsJpeg() {
-		if perceptualHash, err := mediaFile.GetPerceptualHash(); err == nil {
-			file.FilePerceptualHash = perceptualHash
-		}
+	// Color information
+	if p, err := mediaFile.Colors(i.thumbnailsPath()); err == nil {
+		file.FileMainColor = p.MainColor.Name()
+		file.FileColors = p.Colors.Hex()
+		file.FileLuminance = p.Luminance.Hex()
+		file.FileChroma = p.Chroma.Uint()
 	}
 
-	if mediaFile.GetWidth() > 0 && mediaFile.GetHeight() > 0 {
-		file.FileWidth = mediaFile.GetWidth()
-		file.FileHeight = mediaFile.GetHeight()
-		file.FileAspectRatio = mediaFile.GetAspectRatio()
+	if mediaFile.Width() > 0 && mediaFile.Height() > 0 {
+		file.FileWidth = mediaFile.Width()
+		file.FileHeight = mediaFile.Height()
+		file.FileAspectRatio = mediaFile.AspectRatio()
+		file.FilePortrait = mediaFile.Width() < mediaFile.Height()
 	}
 
 	if fileQuery.Error == nil {
-		i.db.Save(&file)
+		i.db.Unscoped().Save(&file)
 		return indexResultUpdated
 	}
 
@@ -229,28 +329,28 @@ func (i *Indexer) indexMediaFile(mediaFile *MediaFile) string {
 func (i *Indexer) IndexRelated(mediaFile *MediaFile) map[string]bool {
 	indexed := make(map[string]bool)
 
-	relatedFiles, mainFile, err := mediaFile.GetRelatedFiles()
+	relatedFiles, mainFile, err := mediaFile.RelatedFiles()
 
 	if err != nil {
-		log.Printf("Could not index \"%s\": %s", mediaFile.GetRelativeFilename(i.originalsPath), err.Error())
+		log.Warnf("could not index \"%s\": %s", mediaFile.RelativeFilename(i.originalsPath()), err.Error())
 
 		return indexed
 	}
 
 	mainIndexResult := i.indexMediaFile(mainFile)
-	indexed[mainFile.GetFilename()] = true
+	indexed[mainFile.Filename()] = true
 
-	log.Printf("%s main %s file \"%s\"", mainIndexResult, mainFile.GetType(), mainFile.GetRelativeFilename(i.originalsPath))
+	log.Infof("%s main %s file \"%s\"", mainIndexResult, mainFile.Type(), mainFile.RelativeFilename(i.originalsPath()))
 
 	for _, relatedMediaFile := range relatedFiles {
-		if indexed[relatedMediaFile.GetFilename()] {
+		if indexed[relatedMediaFile.Filename()] {
 			continue
 		}
 
 		indexResult := i.indexMediaFile(relatedMediaFile)
-		indexed[relatedMediaFile.GetFilename()] = true
+		indexed[relatedMediaFile.Filename()] = true
 
-		log.Printf("%s related %s file \"%s\"", indexResult, relatedMediaFile.GetType(), relatedMediaFile.GetRelativeFilename(i.originalsPath))
+		log.Infof("%s related %s file \"%s\"", indexResult, relatedMediaFile.Type(), relatedMediaFile.RelativeFilename(i.originalsPath()))
 	}
 
 	return indexed
@@ -260,7 +360,7 @@ func (i *Indexer) IndexRelated(mediaFile *MediaFile) map[string]bool {
 func (i *Indexer) IndexAll() map[string]bool {
 	indexed := make(map[string]bool)
 
-	err := filepath.Walk(i.originalsPath, func(filename string, fileInfo os.FileInfo, err error) error {
+	err := filepath.Walk(i.originalsPath(), func(filename string, fileInfo os.FileInfo, err error) error {
 		if err != nil || indexed[filename] {
 			return nil
 		}
@@ -283,7 +383,7 @@ func (i *Indexer) IndexAll() map[string]bool {
 	})
 
 	if err != nil {
-		log.Print(err.Error())
+		log.Warn(err.Error())
 	}
 
 	return indexed

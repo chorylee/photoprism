@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/photoprism/photoprism/internal/models"
+	"github.com/photoprism/photoprism/internal/util"
 	"github.com/pkg/errors"
 )
 
@@ -25,7 +26,7 @@ type openstreetmapAddress struct {
 }
 
 type openstreetmapLocation struct {
-	PlaceID     string                `json:"place_id"`
+	PlaceID     uint                  `json:"place_id"`
 	Lat         string                `json:"lat"`
 	Lon         string                `json:"lon"`
 	Name        string                `json:"name"`
@@ -35,8 +36,8 @@ type openstreetmapLocation struct {
 	Address     *openstreetmapAddress `json:"address"`
 }
 
-// GetLocation See https://wiki.openstreetmap.org/wiki/Nominatim#Reverse_Geocoding
-func (m *MediaFile) GetLocation() (*models.Location, error) {
+// Location See https://wiki.openstreetmap.org/wiki/Nominatim#Reverse_Geocoding
+func (m *MediaFile) Location() (*models.Location, error) {
 	if m.location != nil {
 		return m.location, nil
 	}
@@ -47,12 +48,15 @@ func (m *MediaFile) GetLocation() (*models.Location, error) {
 		Address: &openstreetmapAddress{},
 	}
 
-	if exifData, err := m.GetExifData(); err == nil {
+	if exifData, err := m.Exif(); err == nil {
 		if exifData.Lat == 0 && exifData.Long == 0 {
-			return nil, errors.New("lat and long are missing in metadata")
+			return nil, errors.New("no latitude and longitude in image metadata")
 		}
 
-		url := fmt.Sprintf("https://nominatim.openstreetmap.org/reverse?lat=%f&lon=%f&format=jsonv2", exifData.Lat, exifData.Long)
+		url := fmt.Sprintf(
+			"https://nominatim.openstreetmap.org/reverse?lat=%f&lon=%f&format=jsonv2&accept-language=en&zoom=18",
+			exifData.Lat,
+			exifData.Long)
 
 		if res, err := http.Get(url); err == nil {
 			err = json.NewDecoder(res.Body).Decode(openstreetmapLocation)
@@ -67,8 +71,8 @@ func (m *MediaFile) GetLocation() (*models.Location, error) {
 		return nil, err
 	}
 
-	if id, err := strconv.Atoi(openstreetmapLocation.PlaceID); err == nil && id > 0 {
-		location.ID = uint(id)
+	if id := openstreetmapLocation.PlaceID; id > 0 {
+		location.ID = id
 	} else {
 		return nil, errors.New("query returned no result")
 	}
@@ -87,20 +91,27 @@ func (m *MediaFile) GetLocation() (*models.Location, error) {
 		location.LocLong = lon
 	}
 
-	location.LocName = strings.Title(openstreetmapLocation.Name)
-	location.LocHouseNr = openstreetmapLocation.Address.HouseNumber
-	location.LocStreet = openstreetmapLocation.Address.Road
-	location.LocSuburb = openstreetmapLocation.Address.Suburb
-	location.LocPostcode = openstreetmapLocation.Address.Postcode
-	location.LocCounty = openstreetmapLocation.Address.County
-	location.LocState = openstreetmapLocation.Address.State
-	location.LocCountry = openstreetmapLocation.Address.Country
-	location.LocCountryCode = openstreetmapLocation.Address.CountryCode
-	location.LocDisplayName = openstreetmapLocation.DisplayName
-	location.LocCategory = openstreetmapLocation.Category
+	if len(openstreetmapLocation.Name) > 1 {
+		location.LocName = strings.ReplaceAll(openstreetmapLocation.Name, " - ", " / ")
+		location.LocName = util.Title(strings.TrimSpace(strings.ReplaceAll(location.LocName, "_", " ")))
+	}
+
+	location.LocHouseNr = strings.TrimSpace(openstreetmapLocation.Address.HouseNumber)
+	location.LocStreet = strings.TrimSpace(openstreetmapLocation.Address.Road)
+	location.LocSuburb = strings.TrimSpace(openstreetmapLocation.Address.Suburb)
+	location.LocPostcode = strings.TrimSpace(openstreetmapLocation.Address.Postcode)
+	location.LocCounty = strings.TrimSpace(openstreetmapLocation.Address.County)
+	location.LocState = strings.TrimSpace(openstreetmapLocation.Address.State)
+	location.LocCountry = strings.TrimSpace(openstreetmapLocation.Address.Country)
+	location.LocCountryCode = strings.TrimSpace(openstreetmapLocation.Address.CountryCode)
+	location.LocDisplayName = strings.TrimSpace(openstreetmapLocation.DisplayName)
+
+	locationCategory := strings.TrimSpace(strings.ReplaceAll(openstreetmapLocation.Category, "_", " "))
+	location.LocCategory = locationCategory
 
 	if openstreetmapLocation.Type != "yes" && openstreetmapLocation.Type != "unclassified" {
-		location.LocType = openstreetmapLocation.Type
+		locationType := strings.TrimSpace(strings.ReplaceAll(openstreetmapLocation.Type, "_", " "))
+		location.LocType = locationType
 	}
 
 	m.location = location

@@ -1,10 +1,15 @@
 package commands
 
 import (
-	"fmt"
-	"log"
+	"context"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-	"github.com/photoprism/photoprism/internal/context"
+	log "github.com/sirupsen/logrus"
+
+	"github.com/photoprism/photoprism/internal/config"
 	"github.com/photoprism/photoprism/internal/server"
 	"github.com/urfave/cli"
 )
@@ -39,23 +44,32 @@ var startFlags = []cli.Flag{
 }
 
 func startAction(ctx *cli.Context) error {
-	conf := context.NewConfig(ctx)
-
+	// pass this context down the chain
+	cctx, cancel := context.WithCancel(context.Background())
+	conf := config.NewConfig(ctx)
 	if conf.HttpServerPort() < 1 {
-		log.Fatal("Server port must be a positive integer")
+		log.Fatal("server port must be a positive integer")
 	}
 
 	if err := conf.CreateDirectories(); err != nil {
 		log.Fatal(err)
 	}
 
+	if err := conf.Init(cctx); err != nil {
+		log.Fatal(err)
+	}
 	conf.MigrateDb()
 
-	fmt.Printf("Starting web server at %s:%d...\n", ctx.String("http-host"), ctx.Int("http-port"))
+	log.Infof("starting web server at %s:%d", conf.HttpServerHost(), conf.HttpServerPort())
+	go server.Start(cctx, conf)
 
-	server.Start(conf)
+	quit := make(chan os.Signal)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
-	fmt.Println("Done.")
-
+	<-quit
+	log.Info("Shutting down...")
+	conf.Shutdown()
+	cancel()
+	time.Sleep(3 * time.Second)
 	return nil
 }

@@ -1,11 +1,12 @@
 package commands
 
 import (
-	"fmt"
-	"log"
+	"context"
+	"time"
 
-	"github.com/photoprism/photoprism/internal/context"
+	"github.com/photoprism/photoprism/internal/config"
 	"github.com/photoprism/photoprism/internal/photoprism"
+	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
 
@@ -17,23 +18,33 @@ var IndexCommand = cli.Command{
 }
 
 func indexAction(ctx *cli.Context) error {
-	conf := context.NewConfig(ctx)
+	start := time.Now()
 
+	conf := config.NewConfig(ctx)
 	if err := conf.CreateDirectories(); err != nil {
-		log.Fatal(err)
+		return err
+	}
+
+	cctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := conf.Init(cctx); err != nil {
+		return err
 	}
 
 	conf.MigrateDb()
+	log.Infof("indexing photos in %s", conf.OriginalsPath())
 
-	fmt.Printf("Indexing photos in %s...\n", conf.OriginalsPath())
+	tensorFlow := photoprism.NewTensorFlow(conf)
 
-	tensorFlow := photoprism.NewTensorFlow(conf.TensorFlowModelPath())
+	indexer := photoprism.NewIndexer(conf, tensorFlow)
 
-	indexer := photoprism.NewIndexer(conf.OriginalsPath(), tensorFlow, conf.Db())
+	files := indexer.IndexAll()
 
-	indexer.IndexAll()
+	elapsed := time.Since(start)
 
-	fmt.Println("Done.")
+	log.Infof("indexed %d files in %s", len(files), elapsed)
+
+	conf.Shutdown()
 
 	return nil
 }
